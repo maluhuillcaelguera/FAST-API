@@ -1,10 +1,9 @@
-
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List
 from tensorflow.keras.models import load_model
-from tensorflow.keras.utils import img_to_array
+from tensorflow.keras.utils import img_to_array, custom_object_scope
 from PIL import Image, UnidentifiedImageError
 import numpy as np
 import io
@@ -14,12 +13,16 @@ app = FastAPI()
 logger = logging.getLogger("uvicorn.error")
 
 MODEL_PATH = "mobilenetv2_model.h5"
+
+# Cargar modelo con custom_object_scope para evitar errores de capas personalizadas
 try:
-    model = load_model(MODEL_PATH)
+    with custom_object_scope({}):  # Si tu modelo tiene capas personalizadas, agrégalas aquí
+        model = load_model(MODEL_PATH, compile=False)
 except Exception as e:
     logger.exception(f"Error cargando modelo desde {MODEL_PATH}")
     raise RuntimeError(f"No se pudo cargar el modelo: {e}")
 
+# Clases del modelo
 class_names = [
     "Potato_early_blight",
     "Potato_healthy",
@@ -28,24 +31,29 @@ class_names = [
     "Potato_mosaic_virus"
 ]
 
+# Respuesta de la predicción
 class PredictionResponse(BaseModel):
     predicted_class: str
     confidence: float
     top_k: List[dict]
 
+# Función para procesar imágenes
 def preprocess_image(file_bytes: bytes):
     img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     img = img.resize((224, 224), Image.BILINEAR)
     img_array = img_to_array(img) / 255.0
     return np.expand_dims(img_array, axis=0)
 
+# Endpoint de predicción
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(file: UploadFile = File(...)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="El archivo debe ser una imagen.")
+    
     contents = await file.read()
     if len(contents) == 0:
         raise HTTPException(status_code=400, detail="Archivo vacío.")
+    
     try:
         img_tensor = preprocess_image(contents)
     except UnidentifiedImageError:
@@ -53,18 +61,20 @@ async def predict(file: UploadFile = File(...)):
     except Exception as e:
         logger.exception("Error en preprocess_image")
         raise HTTPException(status_code=500, detail=f"Error al procesar imagen: {e}")
+    
     try:
         preds = model.predict(img_tensor)
         probs = preds.flatten()
         top_indices = probs.argsort()[::-1][:3]
-        top_k = []
-        for idx in top_indices:
-            top_k.append({
-                "class": class_names[idx],
-                "confidence": round(float(probs[idx]), 4)
-            })
+        
+        top_k = [
+            {"class": class_names[idx], "confidence": round(float(probs[idx]), 4)}
+            for idx in top_indices
+        ]
+        
         predicted_class = class_names[int(np.argmax(probs))]
         confidence = float(np.max(probs))
+        
         return PredictionResponse(
             predicted_class=predicted_class,
             confidence=round(confidence, 4),
